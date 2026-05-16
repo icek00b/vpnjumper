@@ -1,0 +1,6 @@
+# VPN Jumper Dependencies
+
+docker>=5.0.0
+
+# Note: docker SDK is optional - script falls back to subprocess mode if not installed
+# Install with: pip install -r requirements.txt
