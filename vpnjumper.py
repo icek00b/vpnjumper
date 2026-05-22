@@ -15,6 +15,9 @@ import time
 import argparse
 import logging
 import tempfile
+import subprocess
+import random
+import json
 from pathlib import Path
 
 # Try to import docker, fall back to subprocess if not available
@@ -27,61 +30,117 @@ except ImportError:
 
 # Configuration
 CONFIG_DIR = Path("/config/vpnjumper")
-INDEX_FILE = CONFIG_DIR / "region_index"
-GLUETUN_VOLUME = "/config/gluetun"
+CONFIG_FILE = CONFIG_DIR / "config.txt"
+GLUETUN_VOLUME = "/config/vpnjumper/gluetun"
 HTTP_PROXY_PORT = 4231
+SERVERS_JSON_PATH = Path("/config/vpnjumper/gluetun/servers.json")
 
-# Private Internet Access VPN credentials
-VPN_USER = "yours"
-VPN_PASS = "secret"
+# Private Internet Access VPN credentials - loaded from config.txt
+VPN_USER = None
+VPN_PASS = None
 
-# All available regions
-REGIONS = [
-    "AU Melbourne", "AU Perth", "AU Sydney", "Albania", "Algeria", "Andorra",
-    "Argentina", "Armenia", "Austria", "Bahamas", "Bangladesh", "Belgium",
-    "Brazil", "Bulgaria", "CA Montreal", "CA Ontario", "CA Toronto", "CA Vancouver",
-    "Cambodia", "China", "Cyprus", "Czech Republic", "DE Berlin", "DE Frankfurt",
-    "Denmark", "Egypt", "Estonia", "Finland", "France", "Georgia", "Greece",
-    "Greenland", "Hong Kong", "Hungary", "Iceland", "India", "Ireland",
-    "Isle Of Man", "Israel", "Italy", "Japan", "Kazakhstan", "Latvia",
-    "Liechtenstein", "Lithuania", "Luxembourg", "Macao", "Macedonia", "Malta",
-    "Mexico", "Moldova", "Monaco", "Mongolia", "Montenegro", "Morocco",
-    "Netherlands", "New Zealand", "Nigeria", "Norway", "Panama", "Philippines",
-    "Poland", "Portugal", "Qatar", "Romania", "Saudi Arabia", "Serbia",
-    "Singapore", "Slovakia", "South Africa", "Spain", "Sri Lanka", "Sweden",
-    "Switzerland", "Taiwan", "Turkey", "UK London", "UK Manchester", "UK Southampton",
-    "US Atlanta", "US California", "US Chicago", "US Denver", "US East", "US Florida",
-    "US Houston", "US Las Vegas", "US New York", "US Seattle", "US Silicon Valley",
-    "US Texas", "US Washington Dc", "US West", "Ukraine", "United Arab Emirates",
-    "Venezuela", "Vietnam"
-]
 
+def load_vpn_credentials():
+    """Load VPN credentials from config.txt file."""
+    global VPN_USER, VPN_PASS
+    
+    if not CONFIG_FILE.exists():
+        logger.error(f"Config file not found at {CONFIG_FILE}")
+        logger.error("Please create config.txt with VPN_USER and VPN_PASS variables")
+        sys.exit(1)
+    
+    try:
+        # Execute config file to set global variables
+        config_globals = {}
+        with open(CONFIG_FILE, 'r') as f:
+            exec(f.read(), config_globals)
+        
+        VPN_USER = config_globals.get('VPN_USER')
+        VPN_PASS = config_globals.get('VPN_PASS')
+        
+        if not VPN_USER or not VPN_PASS:
+            logger.error("VPN_USER and VPN_PASS must be defined in config.txt")
+            sys.exit(1)
+        
+        logger.info("VPN credentials loaded from config.txt")
+    except Exception as e:
+        logger.error(f"Failed to load credentials from config.txt: {e}")
+        sys.exit(1)
+
+
+# Setup logging BEFORE loading credentials
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+# Default region if servers.json doesn't exist
+DEFAULT_REGION = "CA Montreal"
 
-def get_current_index():
-    """Read current region index from file."""
-    if INDEX_FILE.exists():
-        try:
-            return int(INDEX_FILE.read_text().strip())
-        except (ValueError, IOError) as e:
-            logger.warning(f"Failed to read index file: {e}, starting from 0")
-    return 0
+# Load credentials at module initialization
+load_vpn_credentials()
 
 
-def save_index(index):
-    """Save current region index to file."""
-    INDEX_FILE.write_text(str(index))
-    logger.debug(f"Saved index: {index}")
+def load_regions_from_servers_json():
+    """Load all regions from gluetun's servers.json for Private Internet Access."""
+    if not SERVERS_JSON_PATH.exists():
+        logger.info(f"servers.json not found at {SERVERS_JSON_PATH}")
+        return None
+    
+    try:
+        with open(SERVERS_JSON_PATH, 'r') as f:
+            data = json.load(f)
+        
+        if 'private internet access' not in data:
+            logger.warning("'private internet access' not found in servers.json")
+            return None
+        
+        pia_data = data['private internet access']
+        if 'servers' not in pia_data:
+            logger.warning("'servers' not found in 'private internet access' section")
+            return None
+        
+        # Extract unique regions
+        regions = set()
+        for server in pia_data['servers']:
+            if 'region' in server:
+                regions.add(server['region'])
+        
+        if not regions:
+            logger.warning("No regions found in servers.json")
+            return None
+        
+        logger.info(f"Loaded {len(regions)} unique regions from servers.json")
+        return sorted(list(regions))
+    
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse servers.json: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error reading servers.json: {e}")
+        return None
 
 
-def get_next_region(current_index):
-    """Get the next region in rotation."""
-    return REGIONS[current_index % len(REGIONS)]
+def get_randomized_regions():
+    """Get regions from servers.json, randomized. Fall back to default if not found."""
+    regions = load_regions_from_servers_json()
+    
+    if regions is None or len(regions) == 0:
+        logger.info(f"servers.json not available or empty, using default region: {DEFAULT_REGION}")
+        return [DEFAULT_REGION]
+    
+    # Randomize the order
+    random.shuffle(regions)
+    logger.info(f"Regions randomized, total: {len(regions)}")
+    
+    return regions
+
+
+def get_random_region():
+    """Get a random region from the shuffled regions list."""
+    regions = get_randomized_regions()
+    return random.choice(regions)
 
 
 def stop_container(client, name):
@@ -138,23 +197,33 @@ def start_gluetun(client, region):
         raise
 
 
-def wait_for_container(container, timeout=60):
-    """Wait for container to be healthy/running."""
+def wait_for_container(container, timeout=120):
+    """Wait for container to be running AND VPN connected."""
     logger.info(f"Waiting for container {container.name} to be ready...")
     start_time = time.time()
     
     while time.time() - start_time < timeout:
         container.reload()
         if container.status == 'running':
-            # Check logs for any obvious errors
-            logs = container.logs(tail=20).decode('utf-8')
+            # Check logs for VPN connection success
+            logs = container.logs(tail=50).decode('utf-8')
+            
+            # Look for successful VPN connection
+            if 'vpn successfully connected' in logs.lower() or 'public ip' in logs.lower():
+                logger.info(f"Container {container.name} is running with VPN connected")
+                return True
+            
+            # Check for obvious errors (but ignore startup messages)
             if 'error' in logs.lower() and 'starting' not in logs.lower():
                 logger.warning(f"Container logs show potential issues:\n{logs[:500]}")
-            logger.info(f"Container {container.name} is running")
-            return True
-        time.sleep(2)
+            else:
+                logger.debug(f"Container running, waiting for VPN... (still connecting)")
+        time.sleep(3)
     
-    logger.warning(f"Timeout waiting for {container.name}")
+    # Timeout - show recent logs
+    logs = container.logs(tail=30).decode('utf-8')
+    logger.warning(f"Timeout waiting for {container.name} to connect VPN")
+    logger.info(f"Recent logs:\n{logs[:800]}")
     return False
 
 
@@ -164,29 +233,25 @@ def rotate_vpn(sdk_mode=True):
     logger.info("VPN Jumper starting rotation")
     logger.info("=" * 60)
     
-    # Get current index and calculate next region
-    current_index = get_current_index()
-    next_index = (current_index + 1) % len(REGIONS)
-    region = get_next_region(current_index)
+    # Get a random region
+    region = get_random_region()
     
-    logger.info(f"Current index: {current_index}")
-    logger.info(f"Next region: {region}")
-    logger.info(f"Total regions: {len(REGIONS)}")
+    logger.info(f"Selected region: {region}")
     
     if sdk_mode and DOCKER_SDK_AVAILABLE:
-        _rotate_with_sdk(region, current_index, next_index)
+        _rotate_with_sdk(region)
     else:
-        _rotate_with_subprocess(region, current_index, next_index)
+        _rotate_with_subprocess(region)
 
 
-def _rotate_with_sdk(region, current_index, next_index):
+def _rotate_with_sdk(region):
     """Rotate using Docker Python SDK."""
     try:
         client = docker.from_env()
     except Exception as e:
         logger.error(f"Failed to connect to Docker daemon: {e}")
         logger.info("Falling back to subprocess mode")
-        _rotate_with_subprocess(region, current_index, next_index)
+        _rotate_with_subprocess(region)
         return
     
     try:
@@ -210,14 +275,10 @@ def _rotate_with_sdk(region, current_index, next_index):
                 pass
             return
         
-        # Save the next index for subsequent runs
-        save_index(next_index)
-        
         logger.info("=" * 60)
         logger.info(f"VPN rotation complete!")
-        logger.info(f"Region: {region}")
+        logger.info(f"Region: {region} {get_proxy_ip()}")
         logger.info(f"HTTP proxy available on port {HTTP_PROXY_PORT} (gluetun built-in, stealth mode)")
-        logger.info(f"Next region will be: {get_next_region(next_index)}")
         logger.info("=" * 60)
         
     except Exception as e:
@@ -225,10 +286,8 @@ def _rotate_with_sdk(region, current_index, next_index):
         raise
 
 
-def _rotate_with_subprocess(region, current_index, next_index):
+def _rotate_with_subprocess(region):
     """Rotate using subprocess calls to docker CLI."""
-    import subprocess
-    
     try:
         # Stop and remove gluetun container only (no httpproxy anymore)
         logger.info("Stopping existing container...")
@@ -273,27 +332,73 @@ def _rotate_with_subprocess(region, current_index, next_index):
         # Wait for gluetun
         time.sleep(60)  # Give VPN time to connect
         
-        # Save index
-        save_index(next_index)
-        
         logger.info("=" * 60)
         logger.info(f"VPN rotation complete!")
-        logger.info(f"Region: {region}")
+        logger.info(f"Region: {region} {get_proxy_ip()}")
         logger.info(f"HTTP proxy available on port {HTTP_PROXY_PORT} (gluetun built-in, stealth mode)")
-        logger.info(f"Next region will be: {get_next_region(next_index)}")
         logger.info("=" * 60)
         
     except Exception as e:
         logger.error(f"Rotation failed: {e}")
         raise
 
+def get_proxy_ip(max_retries=3, retry_delay=5, auto_rotate=True):
+    import requests
+    proxies = {
+        "http": "http://localhost:4231",
+        "https": "http://localhost:4231"
+    }
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.debug(f"Getting proxy IP (attempt {attempt}/{max_retries})...")
+            response = requests.get(
+                "https://ifconfig.me",
+                proxies=proxies,
+                timeout=10
+            )
+            # Check if the server actually gave us something
+            response.raise_for_status()
+            ip = response.text.strip()
+            logger.info(f"Successfully retrieved IP: {ip}")
+            return ip
+        except requests.exceptions.ProxyError as e:
+            logger.warning(f"Proxy error (attempt {attempt}/{max_retries}): {e}")
+            if attempt < max_retries:
+                logger.info(f"Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"Proxy error after {max_retries} attempts - VPN proxy may not be ready")
+                if auto_rotate:
+                    logger.warning("Bad endpoint detected, triggering automatic rotation...")
+                    # Immediately rotate to next region
+                    rotate_vpn(sdk_mode=True)
+                    return None
+                return None
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Connection error (attempt {attempt}/{max_retries}): {e}")
+            if attempt < max_retries:
+                logger.info(f"Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"Connection error after {max_retries} attempts")
+                return None
+        except requests.exceptions.RequestException as e:
+            # If this  fails, it's just because the world is ending
+            logger.error(f"Request failed (attempt {attempt}/{max_retries}): {e}")
+            if attempt < max_retries:
+                time.sleep(retry_delay)
+            else:
+                return None
+    
+    return None
 
 def list_regions():
     """Print all available regions."""
-    print(f"\nAvailable VPN regions ({len(REGIONS)} total):\n")
-    for i, region in enumerate(REGIONS):
-        marker = " <-- NEXT" if i == (get_current_index() + 1) % len(REGIONS) else ""
-        print(f"  [{i:2d}] {region}{marker}")
+    regions = get_randomized_regions()
+    print(f"\nAvailable VPN regions ({len(regions)} total):\n")
+    for i, region in enumerate(regions):
+        print(f"  [{i:2d}] {region}")
     print()
 
 
